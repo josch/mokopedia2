@@ -1,0 +1,439 @@
+#!/usr/bin/python
+"""
+    mokopedia - the free mobile encyclopedia
+    
+    copyright 2008 - Johannes 'josch' Schauer <j.schauer@email.de>
+
+    This program is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+"""
+
+import sys
+import os
+from BaseHTTPServer import BaseHTTPRequestHandler, HTTPServer
+from ConfigParser import ConfigParser
+from opendir import opendir
+from bsddb import rnopen
+from getopt import getopt
+from random import randint
+from sphinxsearch import SphinxClient, SPH_MATCH_ANY
+from mako.lookup import TemplateLookup
+from mimetypes import guess_type
+
+class Helper(object):
+    _hextochr = None
+
+    #borrowed from module urllib
+    @classmethod
+    def unquote(cls, s):
+        if cls._hextochr is None:
+            cls._hextochr = dict(('%02x' % i, chr(i)) for i in range(256))
+            cls._hextochr.update(('%02X' % i, chr(i)) for i in range(256))
+    
+        res = s.split('%')
+        for i in xrange(1, len(res)):
+            item = res[i]
+            try:
+                res[i] = cls._hextochr[item[:2]] + item[2:]
+            except KeyError:
+                res[i] = '%' + item
+            except UnicodeDecodeError:
+                res[i] = unichr(int(item[:2], 16)) + item[2:]
+        return "".join(res)
+
+    #borrowed from module cgi
+    @classmethod
+    def parse_qs(cls, qs):
+        pairs = [s2 for s1 in qs.split('&') for s2 in s1.split(';')]
+        dict = {}
+        for name_value in pairs:
+            if not name_value and not strict_parsing:
+                continue
+            nv = name_value.split('=', 1)
+            if len(nv) != 2:
+                continue
+            if len(nv[1]) or keep_blank_values:
+                name = cls.unquote(nv[0].replace('+', ' '))
+                value = cls.unquote(nv[1].replace('+', ' '))
+                #overwriting old values
+                dict[name] = value
+        return dict
+
+    #borrowed from module xml.sax.saxutils
+    @classmethod
+    def escape(cls, data):
+        data = data.replace("&", "&amp;")
+        data = data.replace(">", "&gt;")
+        data = data.replace("<", "&lt;")
+        return data
+
+    #borrowed from module shutil
+    @classmethod
+    def copyfileobj(cls, fsrc, fdst, length=16*1024):
+        while 1:
+            buf = fsrc.read(length)
+            if not buf:
+                break
+            fdst.write(buf)
+
+
+class Config(object):
+    data = None
+    
+    def __getitem__(self, k):
+        return Config.data.get(k)
+    
+    def keys(self):
+        return Config.data.keys()
+    
+    def __init__(self):
+        if Config.data is None:
+            config_file = "mokopedia.cfg"
+            
+            opts, args = getopt(sys.argv[1:], "c:", ["config=",])
+            for o, a in opts:
+                if o in ("-c", "--config"):
+                    if os.path.exists(a):
+                        config_file = a
+            
+            config = ConfigParser()
+            try:
+                if not config.read(config_file):
+                    raise
+            except:
+                sys.exit("config file not valid")
+            
+            sphinx_port = 3312
+            Config.data = {}
+            class Dummy(object):
+                pass
+            
+            Config.data["main"] = Dummy()
+            Config.data["main"].__dict__["iw"] = []
+            
+            for section in config.sections():
+                if "main" not in section and os.path.exists(config.get(section, "path")):
+                    Config.data[section] = Dummy()
+                    Config.data["main"].__dict__["iw"].append(section)
+                    
+                    for (name, value) in config.items(section):
+                        Config.data[section].__dict__[name] = value
+                    
+                    Config.data[section].__dict__["lookup"] = TemplateLookup(
+                        directories=[os.path.join(config.get(section, "path"), "templates")],
+                        module_directory=os.path.join(config.get(section, "path"), "modules"),
+                        input_encoding='utf-8', output_encoding='utf-8'
+                    )
+                    
+                    db_path = os.path.join(config.get(section, "path"), "titles.bsddb")
+                    if os.path.exists(db_path):
+                        print "opening titles bsddb..."
+                        Config.data[section].__dict__["titles"] = rnopen(db_path, "r")
+                        
+                        print "starting sphinx daemon for %s wiki..."%section
+                        L = ['searchd', '--port', '%s'%sphinx_port, '--config', '%s/sphinx.conf'%config.get(section, "path"), '--console']
+                        os.spawnvp(os.P_NOWAIT, 'searchd', L)
+                        
+                        Config.data[section].__dict__["sphinx"] = SphinxClient()
+                        Config.data[section].__dict__["sphinx"].SetServer ( "localhost", sphinx_port )
+                        Config.data[section].__dict__["sphinx"].SetMatchMode ( SPH_MATCH_ANY )
+                        sphinx_port+=1
+                    else:
+                        print "no title db for language %s"%section
+                elif "main" in section:
+                    for (name, value) in config.items(section):
+                        Config.data[section].__dict__[name] = value
+    
+class MyHandler(BaseHTTPRequestHandler):
+    
+    def output_wiki_page(self, lang, article):
+        try:
+            file = open(os.path.join(self.config[lang].path, "articles", article), "r")
+        except IOError:
+            self.output_error_page(lang, article)
+        else:
+            self.write_header()
+            template = self.config[lang].lookup.get_template("header.mako")
+            self.wfile.write(template.render(article=unicode(Helper.escape(article), "utf8"), title=unicode(file.readline(), "utf8"), iw=self.config["main"].iw))
+            Helper.copyfileobj(file, self.wfile )
+            template = self.config[lang].lookup.get_template("footer.mako")
+            self.wfile.write(template.render())
+        
+    def output_category_page(self, lang, article, page):
+        folder = os.path.join(self.config[lang].path, "articles", article)
+        try:
+            index = open(os.path.join(folder, "index"), "r")
+        except IOError:
+            self.output_error_page(lang, article)
+        else:
+            d = opendir(folder)
+            
+            #seek to page if necessary
+            if page > 1:
+                for i in xrange(int(self.config["main"].category_size)*(page-1)):
+                    d.read()
+            
+            last_page = False
+            
+            items = []
+            
+            for i in xrange(int(self.config["main"].category_size)):
+                filename = d.read()
+                if filename:
+                    if filename not in [".","..","index"]:
+                        items.append(
+                            (unicode(Helper.escape(os.readlink(os.path.join(folder,filename))[3:]), "utf8"),
+                            unicode(Helper.escape(filename), "utf8"))
+                        )
+                else:
+                    last_page = True
+                    break
+            
+            self.write_header()
+            template = self.config[lang].lookup.get_template("category.mako")
+            self.wfile.write(template.render(
+                article=unicode(article, "utf8"),
+                title=unicode(index.readline(), "utf8"),
+                items=items,
+                last_page=last_page,
+                page=page,
+                article=unicode(article, "utf8"),
+                text=unicode(index.read(), "utf8"),
+                iw=self.config["main"].iw,
+            ))
+    
+    def output_good_articles(self, lang, page):
+        path = os.path.join(self.config[lang].path, "good.bsddb")
+        if os.path.exists(path):
+            db = rnopen(path, "r")
+            offset = (page-1)*int(self.config["main"].result_size)+1
+            max_id = min(len(db), offset+int(self.config["main"].result_size))
+            
+            items = []
+            for i in xrange(offset, max_id):
+                article = unicode(Helper.escape(db[i]), "utf8")
+                items.append((article, article.replace("_", " ")))
+            
+            last_page = max_id == len(db)
+            
+            self.write_header()
+            template = self.config[lang].lookup.get_template("good.mako")
+            self.wfile.write(template.render(
+                items=items,
+                last_page=last_page,
+                page=page,
+                iw=self.config["main"].iw,
+            ))
+        else:
+            self.output_error_good_page(lang)
+        
+    def output_featured_articles(self, lang, page):
+        path = os.path.join(self.config[lang].path, "featured.bsddb")
+        if os.path.exists(path):
+            db = rnopen(path, "r")
+            offset = (page-1)*int(self.config["main"].result_size)
+            max_id = min(len(db), offset+int(self.config["main"].result_size))
+            
+            items = []
+            for i in xrange(offset, max_id):
+                article = unicode(Helper.escape(db[i+1]), "utf8")
+                items.append((article, article.replace("_", " ")))
+            
+            last_page = max_id == len(db)
+            
+            self.write_header()
+            template = self.config[lang].lookup.get_template("featured.mako")
+            self.wfile.write(template.render(
+                items=items,
+                last_page=last_page,
+                page=page,
+                iw=self.config["main"].iw,
+            ))
+        else:
+            self.output_featured_page(lang)
+    
+    def output_result_page(self, lang, text, page):
+        last_page = False
+        
+        page_size = int(self.config["main"].result_size)
+        
+        self.config[lang].sphinx.SetLimits ( page_size*(page-1), page_size)
+        res = self.config[lang].sphinx.Query( text )
+        
+        items = []
+        
+        if res:
+            for match in res['matches']:
+                article = unicode(Helper.escape(self.config[lang].titles[int(match['id'])]), "utf8")
+                items.append((article, article.replace("_", " ")))
+            
+            if res['total_found']/page_size < page:
+                last_page = True
+            
+            if res['total_found'] is 0:
+                page = 0
+                
+            self.write_header()
+            template = self.config[lang].lookup.get_template("result.mako")
+            self.wfile.write(template.render(
+                items=items,
+                last_page=last_page,
+                page=page,
+                text=unicode(Helper.escape(text), "utf8"),
+                iw=self.config["main"].iw,
+            ))
+        else:
+            self.output_error_sphinx_page(lang)
+    
+    def output_error_page(self, lang, article):
+        self.write_header(404)
+        template = self.config[lang].lookup.get_template("error.mako")
+        self.wfile.write(template.render(article=unicode(Helper.escape(article), "utf8"), iw=self.config["main"].iw))
+    
+    def output_error_title_page(self, lang):
+        self.write_header(500)
+        template = self.config[lang].lookup.get_template("error_title.mako")
+        self.wfile.write(template.render(iw=self.config["main"].iw))
+    
+    def output_error_sphinx_page(self, lang):
+        self.write_header(500)
+        template = self.config[lang].lookup.get_template("error_sphinx.mako")
+        self.wfile.write(template.render(iw=self.config["main"].iw))
+        
+    def output_error_featured_page(self, lang):
+        self.write_header(500)
+        template = self.config[lang].lookup.get_template("error_featured.mako")
+        self.wfile.write(template.render(iw=self.config["main"].iw))
+        
+    def output_error_good_page(self, lang):
+        self.write_header(500)
+        template = self.config[lang].lookup.get_template("error_good.mako")
+        self.wfile.write(template.render(iw=self.config["main"].iw))
+        
+    def output_language_chooser(self):
+        self.write_header()
+        self.wfile.write('<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd"><html xmlns="http://www.w3.org/1999/xhtml"> <head> <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" /></head> <body>')
+        for i in self.config.keys():
+            if "main" not in i:
+                self.wfile.write('<a href="/%s">%s</a><br />'%(i,i))
+        self.wfile.write('</body></html>')
+        
+    def output_language_index(self, lang):
+        self.write_header()
+        template = self.config[lang].lookup.get_template("index.mako")
+        self.wfile.write(template.render(iw=self.config["main"].iw))
+        
+    def output_image_redirect(self, lang, article):
+        self.write_header()
+        template = self.config[lang].lookup.get_template("image_redirect.mako")
+        self.wfile.write(template.render(article=unicode(Helper.escape(article), "utf8")))
+        
+    def output_random_redirect(self, lang):
+        article = self.config[lang].titles[randint(1,len(self.config[lang].titles))]
+        self.write_header()
+        template = self.config[lang].lookup.get_template("random_redirect.mako")
+        self.wfile.write(template.render(article=unicode(Helper.escape(article), "utf8")))
+        
+    def output_title_redirect(self, lang, article):
+        article = article.replace(' ', '_')
+        self.write_header()
+        template = self.config[lang].lookup.get_template("title_redirect.mako")
+        self.wfile.write(template.render(article=unicode(Helper.escape(article), "utf8")))
+            
+    def output_raw(self, lang, file):
+        if os.path.exists(os.path.join(self.config[lang].path, file)):
+            self.send_response(200)
+            self.send_header('Content-type', guess_type(file))
+            self.end_headers()
+            Helper.copyfileobj(open(os.path.join(self.config[lang].path, file)), self.wfile)
+        else:
+            self.output_error_page(lang, file)
+    
+    def write_header(self, status=200):
+        #wos.stat = os.fos.stat(file.fileno())
+        self.send_response(status)
+        self.send_header('Content-type', 'application/xml')
+        #self.send_header("Content-Length", str(wos.stat.st_size + os.stat("de/os.static/header").st_size + os.stat("de/os.static/middle").st_size + os.stat("de/os.static/footer").st_size))
+        #self.send_header("Last-Modified", self.date_time_string(wos.stat.st_mtime))
+        self.end_headers()
+        
+    def do_GET(self):
+        self.config = Config()
+        
+        i = self.path.rfind('?')
+        text = ''
+        search = ''
+        page = 1
+        if i >= 0:
+            self.path, query = self.path[:i], self.path[i+1:]
+            if query:
+                dict = Helper.parse_qs(query)
+                if "page" in dict.keys():
+                    page = int(dict["page"])
+                if "text" in dict.keys():
+                    text = dict["text"]
+                    search = dict.get("search", "")
+        
+        addr = [ Helper.unquote(i) for i in self.path.split('/') if i ]
+        
+        if len(addr) > 0 and addr[0] in self.config["main"].iw:
+            lang = addr[0]
+            if len(addr) > 1:
+                addr[1] = '/'.join(addr[1:])
+                if addr[1].startswith(self.config[lang].special+":"):
+                    action = addr[1].split(':', 1)[1]
+                    if action == "Random":
+                        self.output_random_redirect(lang=lang)
+                    elif action == "Good_articles":
+                        self.output_good_articles(lang, page)
+                    elif action == "Featured_articles":
+                        self.output_featured_articles(lang, page)
+                    else:
+                        self.output_error_page(lang=lang, article=addr[1])
+                elif addr[1].startswith(self.config[lang].image+":"):
+                    self.output_image_redirect(lang=lang, article=addr[1])
+                elif addr[1].startswith(self.config[lang].category+":"):
+                    self.output_category_page(lang=lang, article=addr[1], page=page)
+                elif addr[1].startswith("static"):
+                    self.output_raw(lang=lang, file=addr[1])
+                else:
+                    self.output_wiki_page(lang=lang, article=addr[1])
+            else:
+                if text:
+                    if "titles" in self.config[lang].__dict__.keys():
+                        if search:
+                            if "sphinx" in self.config[lang].__dict__.keys():
+                                self.output_result_page(lang, text, page)
+                            else:
+                                self.output_error_sphinx_page(lang)
+                        else:
+                            self.output_title_redirect(lang, text)
+                    else:
+                        self.output_error_title_page(lang)
+                else:
+                    self.output_language_index(lang=lang)
+        else:
+            self.output_language_chooser()
+
+def main():
+    config = Config()
+    try:
+        server = HTTPServer(('', int(config["main"].port)), MyHandler)
+        print 'httpserver started'
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print '^C received, shutting down server'
+        server.socket.close()
+
+if __name__ == '__main__':
+    main()
